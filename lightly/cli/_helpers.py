@@ -1,8 +1,16 @@
-""" Command-Line Interface Helpers """
+""" Command-Line Interface Helpers
+
+This module also provides small factories to build models and utilities via
+configuration, enabling users to plug in custom models/losses/collates by
+supplying a dotted import path (e.g., "mypkg.mymodule:MyClass").
+"""
 
 # Copyright (c) 2020. Lightly AG and its affiliates.
 # All Rights Reserved
 import os
+import importlib
+import pkgutil
+from typing import Any, Callable, Dict, Optional
 
 import hydra
 import torch
@@ -15,6 +23,10 @@ from lightly.models import ZOO as model_zoo
 from lightly.models import ResNetGenerator
 from lightly.models.batchnorm import get_norm_layer
 from lightly.utils.version_compare import version_compare
+from lightly.models.registry import get_registered_model
+from lightly.models.ssl_registry import get_registered_ssl_method
+from lightly.loss.registry import get_registered_loss
+from lightly.data.registry import get_registered_collate
 
 
 def cpu_count():
@@ -90,6 +102,145 @@ def load_state_dict_from_url(url, map_location=None):
     # in this case downloading the pre-trained model was not possible
     # notify the user and return
     return {"state_dict": None}
+
+
+# ---------------------------------------------------------------------------
+# Import utilities and small factories
+# ---------------------------------------------------------------------------
+
+def _import_from_path(class_path: str) -> Any:
+    """Import a symbol from a dotted path.
+
+    Accepts either "pkg.mod:ClassName" or "pkg.mod.ClassName".
+    """
+    if not class_path:
+        raise ValueError("Empty class_path provided for import.")
+    if ":" in class_path:
+        module_path, attr = class_path.split(":", 1)
+    else:
+        parts = class_path.split(".")
+        if len(parts) < 2:
+            raise ValueError(
+                f"Invalid class_path '{class_path}'. Expected 'pkg.mod:Class' or 'pkg.mod.Class'."
+            )
+        module_path, attr = ".".join(parts[:-1]), parts[-1]
+    module = importlib.import_module(module_path)
+    return getattr(module, attr)
+
+
+def _auto_import_submodules(package_name: str) -> None:
+    """Import all submodules of a package to trigger decorator registration.
+
+    This scans the package for modules and imports them. Safe to call multiple times.
+    """
+    try:
+        pkg = importlib.import_module(package_name)
+    except Exception:
+        return
+    if not hasattr(pkg, "__path__"):
+        return
+    for modinfo in pkgutil.walk_packages(pkg.__path__, pkg.__name__ + "."):
+        # Skip private modules
+        name = modinfo.name
+        if any(part.startswith("_") for part in name.split(".")):
+            continue
+        try:
+            importlib.import_module(name)
+        except Exception:
+            # Best-effort import; ignore failures to avoid breaking CLI
+            pass
+
+
+def _ensure_registries_loaded() -> None:
+    """Ensure lightly.models/loss/data packages are imported so registries are populated."""
+    _auto_import_submodules("lightly.models")
+    _auto_import_submodules("lightly.loss")
+    _auto_import_submodules("lightly.data")
+
+
+def build_ssl_model(cfg_model: Dict[str, Any]) -> nn.Module:
+    """Factory to build the SSL model used by CLI tools.
+
+    Supports two modes:
+    - Default SimCLR stack using ResNetGenerator and _SimCLR head (backward compatible).
+    - Custom class via `cfg_model["class_path"]` with optional `cfg_model["init_args"]`.
+    """
+    # 1) Prefer explicit class_path over predefined methods
+    class_path: Optional[str] = cfg_model.get("class_path") or ""
+    if class_path:
+        cls = _import_from_path(class_path)
+        init_args = dict(cfg_model.get("init_args", {}))
+        return cls(**init_args)
+
+    # Load potential registered components
+    _ensure_registries_loaded()
+
+    # 2) SSL method builder via registry (model.method)
+    method_name = (cfg_model.get("method") or "").strip()
+    if method_name:
+        builder = get_registered_ssl_method(method_name)
+        if builder is not None:
+            return builder(cfg_model)
+
+    # 3) A concrete model class registered via lightly.models.registry with model.name
+    name = str(cfg_model.get("name", "")).strip()
+    if name:
+        registered = get_registered_model(name)
+        if registered is not None:
+            init_args = dict(cfg_model.get("init_args", {}))
+            return registered(**init_args)
+
+    # 4) Fallback/default: SimCLR as before
+    resnet = ResNetGenerator(cfg_model["name"], cfg_model["width"])
+    last_conv_channels = list(resnet.children())[-1].in_features
+    features = nn.Sequential(
+        get_norm_layer(3, 0),
+        *list(resnet.children())[:-1],
+        nn.Conv2d(last_conv_channels, cfg_model["num_ftrs"], 1),
+        nn.AdaptiveAvgPool2d(1),
+    )
+
+    return _SimCLR(
+        features, num_ftrs=cfg_model["num_ftrs"], out_dim=cfg_model["out_dim"]
+    )
+
+
+def build_criterion(criterion_cfg: Dict[str, Any]) -> nn.Module:
+    """Factory for criterion (loss): registry by name -> class_path -> default NTXentLoss."""
+    _ensure_registries_loaded()
+    cfg = dict(criterion_cfg) if isinstance(criterion_cfg, dict) else {}
+    name = (cfg.get("name") or "").strip()
+    if name:
+        registered = get_registered_loss(name)
+        if registered is None:
+            raise ValueError(f"Unknown registered loss '{name}'.")
+        kwargs = {k: v for k, v in cfg.items() if k not in ("name", "class_path")}
+        return registered(**kwargs)
+    if cfg.get("class_path"):
+        class_path = cfg.pop("class_path")
+        cls = _import_from_path(class_path)
+        return cls(**cfg)
+    return __import__("lightly.loss", fromlist=["NTXentLoss"]).NTXentLoss(**cfg)
+
+
+def build_collate(collate_cfg: Dict[str, Any]):
+    """Factory for collate: registry by name -> class_path -> default ImageCollateFunction."""
+    from lightly.data import ImageCollateFunction
+
+    _ensure_registries_loaded()
+    cfg = dict(collate_cfg) if isinstance(collate_cfg, dict) else {}
+    name = (cfg.get("name") or "").strip()
+    if name:
+        registered = get_registered_collate(name)
+        if registered is None:
+            raise ValueError(f"Unknown registered collate '{name}'.")
+        kwargs = {k: v for k, v in cfg.items() if k not in ("name", "class_path")}
+        return registered(**kwargs)
+    if cfg.get("class_path"):
+        class_path = cfg.pop("class_path")
+        builder = _import_from_path(class_path)
+        return builder(**cfg)
+    return ImageCollateFunction(**cfg)
 
 
 def _maybe_expand_batchnorm_weights(model_dict, state_dict, num_splits):
@@ -198,37 +349,38 @@ def load_from_state_dict(
 
 def get_model_from_config(cfg, is_cli_call: bool = False) -> SelfSupervisedEmbedding:
     checkpoint = cfg["checkpoint"]
-    if torch.cuda.is_available():
-        device = torch.device("cuda")
-    else:
-        device = torch.device("cpu")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    if not checkpoint:
-        checkpoint, key = get_ptmodel_from_config(cfg["model"])
-        if not checkpoint:
-            msg = "Cannot download checkpoint for key {} ".format(key)
-            msg += "because it does not exist!"
-            raise RuntimeError(msg)
-        state_dict = load_state_dict_from_url(checkpoint, map_location=device)[
-            "state_dict"
-        ]
-    else:
+    # Detect if the model should be considered "custom" (no zoo download required)
+    model_cfg = cfg["model"]
+    is_custom = False
+    # class_path explicitly set
+    if model_cfg.get("class_path"):
+        is_custom = True
+    # registered SSL method
+    elif (model_cfg.get("method") or "") and get_registered_ssl_method(model_cfg.get("method") or "") is not None:
+        is_custom = True
+    # registered concrete model by name
+    elif (model_cfg.get("name") or "") and get_registered_model(str(model_cfg.get("name") or "")) is not None:
+        is_custom = True
+
+    state_dict = None
+    if checkpoint:
         checkpoint = fix_input_path(checkpoint) if is_cli_call else checkpoint
         state_dict = torch.load(checkpoint, map_location=device)["state_dict"]
+    else:
+        if not is_custom:
+            # For built-in SimCLR models, try to get from the zoo; otherwise, require a checkpoint
+            checkpoint, key = get_ptmodel_from_config(model_cfg)
+            if not checkpoint:
+                msg = "Cannot download checkpoint for key {} ".format(key)
+                msg += "because it does not exist!"
+                raise RuntimeError(msg)
+            state = load_state_dict_from_url(checkpoint, map_location=device)
+            state_dict = state.get("state_dict") if isinstance(state, dict) else None
 
-    # load model
-    resnet = ResNetGenerator(cfg["model"]["name"], cfg["model"]["width"])
-    last_conv_channels = list(resnet.children())[-1].in_features
-    features = nn.Sequential(
-        get_norm_layer(3, 0),
-        *list(resnet.children())[:-1],
-        nn.Conv2d(last_conv_channels, cfg["model"]["num_ftrs"], 1),
-        nn.AdaptiveAvgPool2d(1),
-    )
-
-    model = _SimCLR(
-        features, num_ftrs=cfg["model"]["num_ftrs"], out_dim=cfg["model"]["out_dim"]
-    ).to(device)
+    # Build model via factory (will construct custom/registered models or default SimCLR)
+    model = build_ssl_model(model_cfg).to(device)
 
     if state_dict is not None:
         load_from_state_dict(model, state_dict)

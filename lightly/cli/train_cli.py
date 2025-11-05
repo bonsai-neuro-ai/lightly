@@ -13,10 +13,10 @@ import warnings
 
 import hydra
 import torch
-import torch.nn as nn
+# import torch.nn as nn  # not used
 from omegaconf import OmegaConf
 
-from lightly.cli._cli_simclr import _SimCLR
+# from lightly.cli._cli_simclr import _SimCLR  # no longer needed when using factory
 from lightly.cli._helpers import (
     cpu_count,
     fix_hydra_arguments,
@@ -25,13 +25,16 @@ from lightly.cli._helpers import (
     is_url,
     load_from_state_dict,
     load_state_dict_from_url,
+    build_ssl_model,
+    _import_from_path,
 )
 from lightly.data import ImageCollateFunction, LightlyDataset
 from lightly.embedding import SelfSupervisedEmbedding
 from lightly.loss import NTXentLoss
-from lightly.models import ResNetGenerator
-from lightly.models.batchnorm import get_norm_layer
+# from lightly.models import ResNetGenerator  # no longer needed when using factory
+# from lightly.models.batchnorm import get_norm_layer  # no longer needed
 from lightly.utils.hipify import bcolors
+from lightly.cli._helpers import build_criterion, build_collate
 
 
 def _train_cli(cfg, is_cli_call=True):
@@ -89,30 +92,36 @@ def _train_cli(cfg, is_cli_call=True):
         else:
             state_dict = torch.load(checkpoint, map_location="cpu")["state_dict"]
 
-    # load model
-    resnet = ResNetGenerator(cfg["model"]["name"], cfg["model"]["width"])
-    last_conv_channels = list(resnet.children())[-1].in_features
-    features = nn.Sequential(
-        get_norm_layer(3, 0),
-        *list(resnet.children())[:-1],
-        nn.Conv2d(last_conv_channels, cfg["model"]["num_ftrs"], 1),
-        nn.AdaptiveAvgPool2d(1),
-    )
-
-    model = _SimCLR(
-        features, num_ftrs=cfg["model"]["num_ftrs"], out_dim=cfg["model"]["out_dim"]
-    )
+    # Build model (defaults to SimCLR if no custom class_path provided)
+    model = build_ssl_model(cfg["model"])
     if state_dict is not None:
         load_from_state_dict(model, state_dict)
 
-    criterion = NTXentLoss(**cfg["criterion"])
-    optimizer = torch.optim.SGD(model.parameters(), **cfg["optimizer"])
+    # Build criterion via helpers (handles registry, class_path, default)
+    criterion = build_criterion(cfg["criterion"]) if isinstance(cfg.get("criterion"), dict) else NTXentLoss()
+
+    # Build optimizer: support optimizer.name or optimizer.class_path
+    optim_cfg = dict(cfg["optimizer"]) if isinstance(cfg["optimizer"], dict) else {}
+    optim_class = None
+    if optim_cfg.get("class_path"):
+        class_path = optim_cfg.pop("class_path")
+        optim_class = _import_from_path(class_path)
+    elif optim_cfg.get("name"):
+        name = optim_cfg.pop("name")
+        try:
+            optim_class = getattr(torch.optim, name)
+        except AttributeError:
+            raise ValueError(f"Unknown optimizer name '{name}'. Use optimizer.class_path for custom optimizers.")
+    else:
+        optim_class = torch.optim.SGD
+    optimizer = optim_class(model.parameters(), **optim_cfg)
 
     dataset = LightlyDataset(input_dir)
 
     cfg["loader"]["batch_size"] = min(cfg["loader"]["batch_size"], len(dataset))
 
-    collate_fn = ImageCollateFunction(**cfg["collate"])
+    # Build collate via helpers (handles registry, class_path, default)
+    collate_fn = build_collate(cfg["collate"]) if isinstance(cfg.get("collate"), dict) else ImageCollateFunction()
     dataloader = torch.utils.data.DataLoader(
         dataset, **cfg["loader"], collate_fn=collate_fn
     )

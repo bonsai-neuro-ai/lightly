@@ -36,20 +36,38 @@ model:
   out_dim: 128                # Dimensionality of output on which self-supervised loss is calculated.
   num_ftrs: 32                # Dimensionality of feature vectors (embedding size).
   width: 1                    # Width of the resnet.
+  # Optional: use a registered SSL method by simple name (via lightly.models.ssl_registry)
+  method: ''
+  # Optional: Provide a dotted import path to a custom SSL model class.
+  # If set, the above backbone fields are ignored and the class is instantiated
+  # with `init_args`. Examples: 'myproj.models:MySSL' or 'lightly.models.myssl:MySSL'
+  class_path: ''
+  init_args: {}
 
 # criterion namespace: Passed to lightly.loss.NTXentLoss.
 criterion:            
+  # Optional: prefer a registered loss by simple name (via lightly.loss.registry)
+  name: ''
   temperature: 0.5            # Number by which logits are divided.
   memory_bank_size: 0         # Size of the memory bank to use (e.g. for MoCo). 0 means no memory bank.
                               # ^ slight abuse of notation, MoCo paper calls it momentum encoder
+  # Optional: Use a custom loss by dotted import path. If set, the other keys
+  # are passed to the constructor as kwargs.
+  class_path: ''
 
 # optimizer namespace: Passed to torch.optim.SGD.
 optimizer:
+  # Optional: choose optimizer by name (e.g., 'SGD', 'Adam', 'AdamW') or
+  # provide a `class_path` to a custom optimizer. If neither is set, defaults to SGD.
+  name: ''
+  class_path: ''
   lr: 1.                      # Learning rate of the optimizer.
   weight_decay: 0.00001       # L2 penalty.
 
 # collate namespace: Passed to lightly.data.ImageCollateFunction.
 collate:
+  # Optional: prefer a registered collate by simple name (via lightly.data.registry)
+  name: ''
   input_size: 64              # Size of the input images in pixels.
   cj_prob: 0.8                # Probability that color jitter is applied.
   cj_bright: 0.7              # Color_jitter intensity for brightness,
@@ -72,6 +90,9 @@ collate:
                               # by a random angle in [min, max]. If rr_degrees is a
                               # single number, images are rotated by a random angle in
                               # [-rr_degrees, +rr_degrees]. All rotations are counter-clockwise.
+  # Optional: Dotted import path to a custom collate builder/class; if set, the
+  # remaining keys are passed as kwargs to build it.
+  class_path: ''
 
 # loader namespace: Passed to torch.utils.data.DataLoader.
 loader:
