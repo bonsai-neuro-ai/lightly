@@ -80,13 +80,42 @@ __version__ = "1.5.22"
 
 import os
 
+
+def _populate_registries():
+    """Import submodules to trigger registration decorators."""
+    import importlib
+    import pkgutil
+    
+    for pkg_name in ["lightly.models", "lightly.loss", "lightly.data"]:
+        try:
+            pkg = importlib.import_module(pkg_name)
+            if hasattr(pkg, "__path__"):
+                for modinfo in pkgutil.walk_packages(pkg.__path__, pkg.__name__ + "."):
+                    # Skip private modules
+                    if any(part.startswith("_") for part in modinfo.name.split(".")):
+                        continue
+                    try:
+                        importlib.import_module(modinfo.name)
+                    except Exception:
+                        # Best-effort; ignore import failures
+                        pass
+        except Exception:
+            pass
+
+
+_populate_registries()
+
+
 if os.getenv("LIGHTLY_DID_VERSION_CHECK", "False") == "False":
     os.environ["LIGHTLY_DID_VERSION_CHECK"] = "True"
     import multiprocessing
 
     if multiprocessing.current_process().name == "MainProcess":
-        from lightly.api import _version_checking
-
-        _version_checking.check_is_latest_version_in_background(
-            current_version=__version__
-        )
+        try:
+            from lightly.api import _version_checking
+            _version_checking.check_is_latest_version_in_background(
+                current_version=__version__
+            )
+        except Exception:
+            # Ignore version check failures (e.g., missing pydantic)
+            pass
