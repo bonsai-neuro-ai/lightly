@@ -1,6 +1,8 @@
 import traceback
 import warnings
 
+from torchvision.utils import save_image
+
 
 def warn_with_traceback(message, category, filename, lineno, file=None, line=None):
     log = f"{filename}:{lineno}: {category.__name__}: {message}\n"
@@ -68,6 +70,7 @@ parser.add_argument("--skip-finetune-eval", action="store_true")
 parser.add_argument("--float32-matmul-precision", type=str, default="high")
 parser.add_argument("--strategy", default="ddp_find_unused_parameters_true")
 parser.add_argument("--seed", type=int, default=None)
+parser.add_argument("--vis-samples", action="store_true")
 
 METHODS = {
     "barlowtwins": {
@@ -84,6 +87,20 @@ METHODS = {
     "tico": {"model": tico.TiCo, "transform": tico.transform},
     "vicreg": {"model": vicreg.VICReg, "transform": vicreg.transform},
 }
+
+
+def vis_samples_for_method(method: str, train_dir : Path, log_dir : Path):
+    train_transform = METHODS[method]["transform"]
+    train_dataset = LightlyDataset(input_dir=str(train_dir), transform=train_transform)
+    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=16, shuffle=True)
+    example = next(iter(train_loader))[0]
+    for i, ex in enumerate(example):
+        save_image(
+            ex,
+            log_dir / method / f"example{i:02d}.png",
+            format="png",
+            normalize=True,
+        )
 
 
 def main(
@@ -108,6 +125,7 @@ def main(
     float32_matmul_precision: str,
     strategy: str,
     seed: int | None = None,
+    vis_samples: bool = False,
 ) -> None:
     print_rank_zero(f"Args: {locals()}")
     if seed is not None:
@@ -118,6 +136,11 @@ def main(
     method_names = methods or METHODS.keys()
 
     for method in method_names:
+        if vis_samples:
+            (log_dir / method).mkdir(exist_ok=True, parents=True)
+            vis_samples_for_method(method, train_dir, log_dir)
+            continue
+
         method_dir = (
             log_dir / method / datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         ).resolve()
