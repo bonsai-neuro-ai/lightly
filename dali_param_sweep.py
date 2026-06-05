@@ -21,8 +21,10 @@ Adjust the config block to match your system.
 import csv
 import gc
 import time
+from dataclasses import dataclass, asdict, fields
+from os import SEEK_CUR
 from pathlib import Path
-from typing import assert_never
+from typing import assert_never, Literal
 
 import torch
 from torchvision.models import resnet50, vit_b_16
@@ -182,48 +184,92 @@ def make_tv(batch_size, num_workers):
         num_workers=num_workers,
         pin_memory=True,
         drop_last=True,
-        persistent_workers=True,
+        persistent_workers=False,
         prefetch_factor=4,
     )
 
 
-def run_config(backend, batch_size, workers, mode, model=None, compile=False, amp=False):
-    match backend:
-        case "DALI":
-            iterator = dali_batches(make_dali(batch_size, workers))
-        case "TV":
-            iterator = tv_batches(make_tv(batch_size, workers))
-        case _:
-            assert_never(backend)
+@dataclass(frozen=True)
+class RunConfig:
+    backend: Literal["DALI", "TV"]
+    batch_size: int
+    workers: int
+    mode: Literal["data-only", "fwd", "fwd+bwd"]
+    model: Literal["", "resnet50", "vit_b_16"] = ""
+    compile: bool = False
+    amp: bool = False
+    throughput: float = float("nan")
 
-    match mode:
-        case "data-only":
-            process_fn = None
-        case "fwd":
-            process_fn = make_forward_fn(model, compile=compile, amp=amp)
-        case "fwd+bwd":
-            process_fn = make_forward_backward_fn(model, compile=compile, amp=amp)
-        case _:
-            assert_never(mode)
+    def __post_init__(self):
+        super().__setattr__("backend", self.backend.upper())
+        super().__setattr__("batch_size", int(self.batch_size))
+        super().__setattr__("workers", int(self.workers))
+        super().__setattr__("mode", self.mode.lower())
+        super().__setattr__("model", self.model.lower())
+        super().__setattr__("compile", bool(self.compile))
+        super().__setattr__("amp", bool(self.amp))
+        super().__setattr__("throughput", float(self.throughput))
 
+    def get_iterator(self):
+        match self.backend:
+            case "DALI":
+                return dali_batches(make_dali(self.batch_size, self.workers))
+            case "TV":
+                return tv_batches(make_tv(self.batch_size, self.workers))
+            case _:
+                assert_never(self.backend)
+
+    def get_process_fn(self):
+        match self.mode:
+            case "data-only":
+                return None
+            case "fwd":
+                return make_forward_fn(self.model, compile=self.compile, amp=self.amp)
+            case "fwd+bwd":
+                return make_forward_backward_fn(self.model, compile=self.compile, amp=self.amp)
+            case _:
+                assert_never(self.mode)
+
+    def __hash__(self):
+        if self.mode == "data-only":
+            return hash(
+                (
+                    self.backend,
+                    self.batch_size,
+                    self.workers,
+                    self.mode,
+                )
+            )
+        else:
+            return hash(
+                (
+                    self.backend,
+                    self.batch_size,
+                    self.workers,
+                    self.mode,
+                    self.model,
+                    self.compile,
+                    self.amp,
+                )
+            )
+
+    def __eq__(self, other):
+        return self.__hash__() == other.__hash__()
+
+
+def run_config(config: RunConfig) -> RunConfig:
+    iterator = config.get_iterator()
+    process_fn = config.get_process_fn()
     try:
-        throughput = measure_throughput(iterator, batch_size, process_fn)
+        throughput = measure_throughput(iterator, config.batch_size, process_fn)
     except RuntimeError:
         throughput = float("nan")
     finally:
         gc.collect()
         torch.cuda.empty_cache()
 
-    return {
-        "backend": backend,
-        "model": model,
-        "batch_size": batch_size,
-        "workers": workers,
-        "mode": mode,
-        "compile": compile,
-        "amp": amp,
-        "throughput": throughput,
-    }
+    # RunConfig is frozen. Create and return a new object to set the 'throughput' attribute.
+    return RunConfig(**{**asdict(config), "throughput": throughput})
 
 
 if __name__ == "__main__":
@@ -235,13 +281,11 @@ if __name__ == "__main__":
         for bs in BATCH_SIZES:
             for wrk in WORKER_COUNTS:
                 jobs.add(
-                    frozenset(
-                        [
-                            ("backend", backend),
-                            ("batch_size", bs),
-                            ("workers", wrk),
-                            ("mode", "data-only"),
-                        ]
+                    RunConfig(
+                        backend=backend,
+                        batch_size=bs,
+                        workers=wrk,
+                        mode="data-only",
                     )
                 )
 
@@ -253,16 +297,14 @@ if __name__ == "__main__":
                     for amp in [True, False]:
                         for mode in ["fwd", "fwd+bwd"]:
                             jobs.add(
-                                frozenset(
-                                    [
-                                        ("backend", backend),
-                                        ("batch_size", bs),
-                                        ("workers", MODEL_WORKERS),
-                                        ("mode", mode),
-                                        ("model", model),
-                                        ("compile", compile),
-                                        ("amp", amp),
-                                    ]
+                                RunConfig(
+                                    backend=backend,
+                                    batch_size=bs,
+                                    workers=MODEL_WORKERS,
+                                    mode=mode,
+                                    model=model,
+                                    compile=compile,
+                                    amp=amp,
                                 )
                             )
 
@@ -275,26 +317,21 @@ if __name__ == "__main__":
     with results_file.open("r") as f:
         reader = csv.DictReader(f)
         for row in reader:
-            finished_jobs.add(frozenset((k, v) for (k, v) in row.items() if k != "throughput"))
+            cfg = RunConfig(**row)
+            if cfg in finished_jobs:
+                print("Duplicate finished:", cfg, *[j for j in finished_jobs if j == cfg])
+            finished_jobs.add(cfg)
 
-    with open(results_file, "a", newline="") as f:
-        writer = csv.DictWriter(
-            f,
-            fieldnames=[
-                "backend",
-                "model",
-                "batch_size",
-                "workers",
-                "mode",
-                "compile",
-                "amp",
-                "throughput",
-            ],
-        )
-        if f.tell() == 0:
+    print(f"{len(jobs)} total jobs")
+    print(f"{len(finished_jobs)} finished jobs")
+    print(f"{len(jobs - finished_jobs)} to-do")
+
+    with open(results_file, "a") as f:
+        writer = csv.DictWriter(f, fieldnames=[f.name for f in fields(RunConfig)])
+        if f.seek(SEEK_CUR) == 0:
             writer.writeheader()
 
         for job in tqdm(jobs - finished_jobs, initial=len(finished_jobs), total=len(jobs)):
-            result = run_config(**dict(job))
-            writer.writerow(result)
+            result = run_config(job)
+            writer.writerow(asdict(result))
             f.flush()
