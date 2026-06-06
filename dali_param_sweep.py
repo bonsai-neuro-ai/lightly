@@ -41,13 +41,10 @@ MATMUL_PRECISION = "medium"
 DATA_ROOT = "/data/datasets/imagenet/val/"
 torch.set_float32_matmul_precision(MATMUL_PRECISION)
 
-# Section 1: data-only sweep
 BATCH_SIZES = [64, 128, 256, 512]
-WORKER_COUNTS = [2, 4, 8, 16]
+WORKER_COUNTS = [2, 4, 8, 16, 32]
 
-# Sections 2 & 3: model benchmarks
-MODEL_BATCH_SIZES = [64, 128, 256, 512]
-MODEL_WORKERS = 16
+WORKERS_FOR_FWD_BWD = 16
 
 NUM_WARMUP = 5
 NUM_BATCHES = 50
@@ -189,6 +186,15 @@ def make_tv(batch_size, num_workers):
     )
 
 
+def cast_to_bool(v: str | bool) -> bool:
+    if isinstance(v, str):
+        return v.lower() in ("true", "t", "1")
+    elif isinstance(v, bool):
+        return v
+    else:
+        raise ValueError(f"Unknown boolean value {v}")
+
+
 @dataclass(frozen=True)
 class RunConfig:
     backend: Literal["DALI", "TV"]
@@ -206,8 +212,8 @@ class RunConfig:
         super().__setattr__("workers", int(self.workers))
         super().__setattr__("mode", self.mode.lower())
         super().__setattr__("model", self.model.lower())
-        super().__setattr__("compile", bool(self.compile))
-        super().__setattr__("amp", bool(self.amp))
+        super().__setattr__("compile", cast_to_bool(self.compile))
+        super().__setattr__("amp", cast_to_bool(self.amp))
         super().__setattr__("throughput", float(self.throughput))
 
     def get_iterator(self):
@@ -230,31 +236,33 @@ class RunConfig:
             case _:
                 assert_never(self.mode)
 
-    def __hash__(self):
+    def _tuplify(self):
         if self.mode == "data-only":
-            return hash(
-                (
-                    self.backend,
-                    self.batch_size,
-                    self.workers,
-                    self.mode,
-                )
+            return (
+                self.backend,
+                self.batch_size,
+                self.workers,
+                self.mode,
             )
         else:
-            return hash(
-                (
-                    self.backend,
-                    self.batch_size,
-                    self.workers,
-                    self.mode,
-                    self.model,
-                    self.compile,
-                    self.amp,
-                )
+            return (
+                self.backend,
+                self.batch_size,
+                self.workers,
+                self.mode,
+                self.model,
+                self.compile,
+                self.amp,
             )
 
+    def __hash__(self):
+        return hash(self._tuplify())
+
     def __eq__(self, other):
-        return self.__hash__() == other.__hash__()
+        return self._tuplify() == other._tuplify()
+
+    def set_throughput(self, tput: float) -> "RunConfig":
+        return self.__class__(**{**asdict(self), "throughput": tput})
 
 
 def run_config(config: RunConfig) -> RunConfig:
@@ -263,13 +271,13 @@ def run_config(config: RunConfig) -> RunConfig:
     try:
         throughput = measure_throughput(iterator, config.batch_size, process_fn)
     except RuntimeError:
-        throughput = float("nan")
+        throughput = 0.0
     finally:
         gc.collect()
         torch.cuda.empty_cache()
 
     # RunConfig is frozen. Create and return a new object to set the 'throughput' attribute.
-    return RunConfig(**{**asdict(config), "throughput": throughput})
+    return config.set_throughput(throughput)
 
 
 if __name__ == "__main__":
@@ -291,19 +299,19 @@ if __name__ == "__main__":
 
     # Further iterate over models and accelerators; use fixed batch size though
     for backend in ["DALI", "TV"]:
-        for bs in MODEL_BATCH_SIZES:
+        for bs in BATCH_SIZES:
             for model in ["resnet50", "vit_b_16"]:
-                for compile in [True, False]:
+                for cmp in [True, False]:
                     for amp in [True, False]:
                         for mode in ["fwd", "fwd+bwd"]:
                             jobs.add(
                                 RunConfig(
                                     backend=backend,
                                     batch_size=bs,
-                                    workers=MODEL_WORKERS,
+                                    workers=WORKERS_FOR_FWD_BWD,
                                     mode=mode,
                                     model=model,
-                                    compile=compile,
+                                    compile=cmp,
                                     amp=amp,
                                 )
                             )
@@ -318,8 +326,6 @@ if __name__ == "__main__":
         reader = csv.DictReader(f)
         for row in reader:
             cfg = RunConfig(**row)
-            if cfg in finished_jobs:
-                print("Duplicate finished:", cfg, *[j for j in finished_jobs if j == cfg])
             finished_jobs.add(cfg)
 
     print(f"{len(jobs)} total jobs")
