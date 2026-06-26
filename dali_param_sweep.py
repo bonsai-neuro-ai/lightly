@@ -38,7 +38,6 @@ from lightly.transforms.dali_byol_transform import DaliBYOLDataLoader
 # Config
 # ---------------------------------------------------------------------------
 MATMUL_PRECISION = "medium"
-DATA_ROOT = "/data/datasets/imagenet/val/"
 torch.set_float32_matmul_precision(MATMUL_PRECISION)
 
 BATCH_SIZES = [64, 128, 256, 512]
@@ -169,12 +168,12 @@ def measure_throughput(batches, batch_size: int, process_fn=None) -> float:
     return batch_size / (sum(intervals) / len(intervals))
 
 
-def make_dali(batch_size, num_threads):
-    return DaliBYOLDataLoader(DATA_ROOT, batch_size=batch_size, num_threads=num_threads)
+def make_dali(data_root, batch_size, num_threads):
+    return DaliBYOLDataLoader(data_root, batch_size=batch_size, num_threads=num_threads)
 
 
-def make_tv(batch_size, num_workers):
-    ds = LightlyDataset(DATA_ROOT, transform=BYOLTransform())
+def make_tv(data_root, batch_size, num_workers):
+    ds = LightlyDataset(data_root, transform=BYOLTransform())
     return torch.utils.data.DataLoader(
         ds,
         batch_size=batch_size,
@@ -197,6 +196,7 @@ def cast_to_bool(v: str | bool) -> bool:
 
 @dataclass(frozen=True)
 class RunConfig:
+    data_root: str
     backend: Literal["DALI", "TV"]
     batch_size: int
     workers: int
@@ -219,9 +219,9 @@ class RunConfig:
     def get_iterator(self):
         match self.backend:
             case "DALI":
-                return dali_batches(make_dali(self.batch_size, self.workers))
+                return dali_batches(make_dali(self.data_root, self.batch_size, self.workers))
             case "TV":
-                return tv_batches(make_tv(self.batch_size, self.workers))
+                return tv_batches(make_tv(self.data_root, self.batch_size, self.workers))
             case _:
                 assert_never(self.backend)
 
@@ -281,40 +281,50 @@ def run_config(config: RunConfig) -> RunConfig:
 
 
 if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--data_root", nargs="+")
+    parser.add_argument("--backends", nargs="+", default=["DALI", "TV"])
+    args = parser.parse_args()
     # — Part 1: Setup jobs to be run —————————————————————————
 
     # Start with 'data-only' results (no model, no model accelerators)
     jobs = set()
-    for backend in ["DALI", "TV"]:
-        for bs in BATCH_SIZES:
-            for wrk in WORKER_COUNTS:
-                jobs.add(
-                    RunConfig(
-                        backend=backend,
-                        batch_size=bs,
-                        workers=wrk,
-                        mode="data-only",
+    for root in args.data_root:
+        for backend in args.backends:
+            for bs in BATCH_SIZES:
+                for wrk in WORKER_COUNTS:
+                    jobs.add(
+                        RunConfig(
+                            data_root=root,
+                            backend=backend,
+                            batch_size=bs,
+                            workers=wrk,
+                            mode="data-only",
+                        )
                     )
-                )
 
     # Further iterate over models and accelerators; use fixed batch size though
-    for backend in ["DALI", "TV"]:
-        for bs in BATCH_SIZES:
-            for model in ["resnet50", "vit_b_16"]:
-                for cmp in [True, False]:
-                    for amp in [True, False]:
-                        for mode in ["fwd", "fwd+bwd"]:
-                            jobs.add(
-                                RunConfig(
-                                    backend=backend,
-                                    batch_size=bs,
-                                    workers=WORKERS_FOR_FWD_BWD,
-                                    mode=mode,
-                                    model=model,
-                                    compile=cmp,
-                                    amp=amp,
+    for root in args.data_root:
+        for backend in args.backends:
+            for bs in BATCH_SIZES:
+                for model in ["resnet50", "vit_b_16"]:
+                    for cmp in [True, False]:
+                        for amp in [True, False]:
+                            for mode in ["fwd", "fwd+bwd"]:
+                                jobs.add(
+                                    RunConfig(
+                                        data_root=root,
+                                        backend=backend,
+                                        batch_size=bs,
+                                        workers=WORKERS_FOR_FWD_BWD,
+                                        mode=mode,
+                                        model=model,
+                                        compile=cmp,
+                                        amp=amp,
+                                    )
                                 )
-                            )
 
     # — Part 2: Load existing outputs and run those that need running ——————————
     results_file = Path("dali_param_sweep.csv")
