@@ -40,13 +40,13 @@ from lightly.transforms.dali_byol_transform import DaliBYOLDataLoader
 MATMUL_PRECISION = "medium"
 torch.set_float32_matmul_precision(MATMUL_PRECISION)
 
-BATCH_SIZES = [64, 128, 256, 512]
-WORKER_COUNTS = [2, 4, 8, 16, 32]
+BATCH_SIZES = [64, 128, 256, 512, 1024]
+WORKER_COUNTS = [2, 4, 8, 16, 32, 64]
 
 WORKERS_FOR_FWD_BWD = 16
 
 NUM_WARMUP = 5
-NUM_BATCHES = 50
+NUM_BATCHES = 100
 
 
 # ---------------------------------------------------------------------------
@@ -181,7 +181,6 @@ def make_tv(data_root, batch_size, num_workers):
         pin_memory=True,
         drop_last=True,
         persistent_workers=False,
-        prefetch_factor=4,
     )
 
 
@@ -239,6 +238,7 @@ class RunConfig:
     def _tuplify(self):
         if self.mode == "data-only":
             return (
+                self.data_root,
                 self.backend,
                 self.batch_size,
                 self.workers,
@@ -246,6 +246,7 @@ class RunConfig:
             )
         else:
             return (
+                self.data_root,
                 self.backend,
                 self.batch_size,
                 self.workers,
@@ -291,9 +292,9 @@ if __name__ == "__main__":
 
     # Start with 'data-only' results (no model, no model accelerators)
     jobs = set()
-    for root in args.data_root:
-        for backend in args.backends:
-            for bs in BATCH_SIZES:
+    for bs in BATCH_SIZES:
+        for root in args.data_root:
+            for backend in args.backends:
                 for wrk in WORKER_COUNTS:
                     jobs.add(
                         RunConfig(
@@ -306,9 +307,9 @@ if __name__ == "__main__":
                     )
 
     # Further iterate over models and accelerators; use fixed batch size though
-    for root in args.data_root:
-        for backend in args.backends:
-            for bs in BATCH_SIZES:
+    for bs in BATCH_SIZES:
+        for root in args.data_root:
+            for backend in args.backends:
                 for model in ["resnet50", "vit_b_16"]:
                     for cmp in [True, False]:
                         for amp in [True, False]:
