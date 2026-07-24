@@ -24,8 +24,8 @@ class VICReg(LightningModule):
         resnet = resnet50()
         resnet.fc = Identity()  # Ignore classification head
         self.backbone = resnet
-        self.projection_head = VICRegProjectionHead(num_layers=2)
-        self.criterion = VICRegLoss()
+        self.projection_head = VICRegProjectionHead(num_layers=3)
+        self.criterion = VICRegLoss(gather_distributed=True)
 
         self.online_classifier = OnlineLinearClassifier(num_classes=num_classes)
 
